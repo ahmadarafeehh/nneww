@@ -97,10 +97,6 @@ class _SearchScreenState extends State<SearchScreen> {
   Set<String> blockedUsersSet = {};
   bool _isLoading = true;
 
-  // REMOVED: Ad-related variables
-  // BannerAd? _bannerAd;
-  // bool _isAdLoaded = false;
-
   // Pagination helpers
   int _offset = 0;
   bool _isLoadingMore = false;
@@ -128,7 +124,6 @@ class _SearchScreenState extends State<SearchScreen> {
   void initState() {
     super.initState();
     _initData();
-    // REMOVED: _loadBannerAd();
 
     _scrollController.addListener(() {
       if (_scrollController.position.pixels >=
@@ -141,13 +136,10 @@ class _SearchScreenState extends State<SearchScreen> {
     });
   }
 
-  // REMOVED: _loadBannerAd method
-
   @override
   void dispose() {
     searchController.dispose();
     _scrollController.dispose();
-    // REMOVED: _bannerAd?.dispose();
 
     // Dispose all video controllers
     for (final controller in _videoControllers.values) {
@@ -464,19 +456,26 @@ class _SearchScreenState extends State<SearchScreen> {
       body: _isLoading
           ? Center(
               child: CircularProgressIndicator(
-                  color: colors.progressIndicatorColor))
-          : Expanded(
-              child: _isSearchFocused && searchController.text.trim().isEmpty
-                  ? Padding(
-                      padding: const EdgeInsets.only(top: 15.0),
-                      child: _buildSuggestedUsers(colors),
-                    )
-                  : isShowUsers
-                      ? Padding(
-                          padding: const EdgeInsets.only(top: 15.0),
-                          child: _buildUserSearch(colors),
-                        )
-                      : _buildPostsGrid(colors),
+                  color: colors.progressIndicatorColor),
+            )
+          : Column(
+              children: [
+                // Main content area that takes all available space
+                Expanded(
+                  child:
+                      _isSearchFocused && searchController.text.trim().isEmpty
+                          ? Padding(
+                              padding: const EdgeInsets.only(top: 15.0),
+                              child: _buildSuggestedUsers(colors),
+                            )
+                          : isShowUsers
+                              ? Padding(
+                                  padding: const EdgeInsets.only(top: 15.0),
+                                  child: _buildUserSearch(colors),
+                                )
+                              : _buildPostsGrid(colors),
+                ),
+              ],
             ),
       appBar: AppBar(
         backgroundColor: colors.appBarBackgroundColor,
