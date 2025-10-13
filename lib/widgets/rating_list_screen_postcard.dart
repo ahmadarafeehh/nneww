@@ -136,13 +136,18 @@ class _RatingListScreenState extends State<RatingListScreen> {
     setState(() => _isLoadingMore = true);
 
     try {
+      final start = _page * _limit;
+      final end = start + _limit - 1;
+
       final response = await Supabase.instance.client
           .from('post_rating')
-          .select(
-              '*, users!userid(username, photoUrl)') // Changed to users!userid
+          .select('''
+          *,
+          users!userid(username, photoUrl)
+        ''')
           .eq('postid', widget.postId)
           .order('timestamp', ascending: false)
-          .range(0, _limit - 1);
+          .range(start, end); // Use calculated range
 
       if (mounted) {
         setState(() {
@@ -155,11 +160,12 @@ class _RatingListScreenState extends State<RatingListScreen> {
           _page++;
           _hasMore = newRatings.length == _limit;
 
-          // Cache user info
+          // Cache user info - FIXED: use 'users' instead of 'user'
           for (var rating in newRatings) {
             final userId = rating['userid'] as String?;
             if (userId != null) {
-              final userData = rating['user'] as Map<String, dynamic>?;
+              final userData =
+                  rating['users'] as Map<String, dynamic>?; // Fixed this line
               if (userData != null) {
                 _userCache[userId] = userData;
               }
