@@ -79,8 +79,11 @@ class SupabaseProfileMethods {
             }
           }
 
-          // Delete post views
-          await _supabase.from('post_views').delete().eq('postid', postId);
+          // CORRECTED: Delete post views from the correct table
+          await _supabase
+              .from('user_post_views')
+              .delete()
+              .eq('post_id', postId);
 
           // Delete related comments/replies/ratings/notifications for this post
           await _supabase.from('comments').delete().eq('postid', postId);
@@ -684,7 +687,7 @@ class SupabaseProfileMethods {
           await _supabase
               .from('user_post_views')
               .delete()
-              .eq('post_id', postId);
+              .eq('post_id', postId); // Changed to 'post_id' to match schema
         }
       }
     } catch (e) {
