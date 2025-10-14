@@ -67,16 +67,26 @@ class FeedMessages extends StatefulWidget {
 }
 
 class _FeedMessagesState extends State<FeedMessages>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, AutomaticKeepAliveClientMixin {
   final SupabaseClient _supabase = Supabase.instance.client;
 
   List<Map<String, dynamic>> _existingChats = [];
   List<String> _blockedUsers = [];
-  List<String> _suggestedUserIds = [];
-  bool _showSuggestions = false;
-  bool _needsRefresh = false;
+  List<Map<String, dynamic>> _suggestedUsers = [];
 
-  // Helper method to get the appropriate color scheme
+  // Caches for optimized performance
+  final Map<String, Map<String, dynamic>> _userCache = {};
+  final Map<String, Map<String, dynamic>> _lastMessageCache = {};
+  final Map<String, int> _unreadCountCache = {};
+
+  bool _isLoading = true;
+  bool _showSuggestions = false;
+  bool _loadingMore = false;
+  bool _hasMoreChats = true;
+
+  @override
+  bool get wantKeepAlive => true;
+
   _FeedMessagesColorSet _getColors(ThemeProvider themeProvider) {
     final isDarkMode = themeProvider.themeMode == ThemeMode.dark;
     return isDarkMode ? _FeedMessagesDarkColors() : _FeedMessagesLightColors();
@@ -86,7 +96,7 @@ class _FeedMessagesState extends State<FeedMessages>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _loadBlockedUsers();
+    _loadInitialDataUltraFast();
   }
 
   @override
@@ -95,103 +105,296 @@ class _FeedMessagesState extends State<FeedMessages>
     super.dispose();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      // Refresh when app comes to foreground
-      _refreshData();
+  Future<void> _loadInitialDataUltraFast() async {
+    if (!mounted) return;
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      await _loadBlockedUsers();
+      await _loadChatsMinimal();
+
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+
+      _loadAdditionalDataInBackground();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
   }
 
-  void _refreshData() {
+  Future<void> _loadChatsMinimal() async {
+    final chats = await _supabase
+        .from('chats')
+        .select()
+        .contains('participants', [widget.currentUserId])
+        .order('last_updated', ascending: false)
+        .limit(11);
+
+    if (chats.isEmpty) {
+      _existingChats = [];
+      return;
+    }
+
+    final validChats = <Map<String, dynamic>>[];
+    for (final chat in chats) {
+      final participants = List<String>.from(chat['participants']);
+      final otherUserId = participants.firstWhere(
+        (id) => id != widget.currentUserId,
+        orElse: () => '',
+      );
+      if (otherUserId.isNotEmpty && !_blockedUsers.contains(otherUserId)) {
+        validChats.add(chat);
+      }
+    }
+
     if (mounted) {
       setState(() {
-        _needsRefresh = true;
+        _existingChats = validChats;
+        _hasMoreChats = chats.length == 11;
       });
     }
   }
 
-  Future<void> _loadBlockedUsers() async {
-    final blockedUsers =
-        await SupabaseBlockMethods().getBlockedUsers(widget.currentUserId);
+  Future<void> _loadAdditionalDataInBackground() async {
+    if (_existingChats.isEmpty) {
+      return;
+    }
+
+    final userIDs = <String>[];
+    for (final chat in _existingChats) {
+      final participants = List<String>.from(chat['participants']);
+      final otherUserId = participants.firstWhere(
+        (id) => id != widget.currentUserId,
+      );
+      userIDs.add(otherUserId);
+    }
+
+    await Future.wait([
+      _loadUsersBatch(userIDs),
+      _loadLastMessagesBatch(
+          _existingChats.map((c) => c['id'] as String).toList()),
+      _loadUnreadCountsBatch(_existingChats),
+      _loadSuggestions(),
+    ]);
+  }
+
+  Future<void> _loadUsersBatch(List<String> userIds) async {
+    if (userIds.isEmpty) {
+      return;
+    }
+
+    final users =
+        await _supabase.from('users').select().inFilter('uid', userIds);
+
+    for (final user in users) {
+      _userCache[user['uid']] = user;
+    }
+
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _loadLastMessagesBatch(List<String> chatIds) async {
+    if (chatIds.isEmpty) {
+      return;
+    }
+
+    final messages = await _supabase
+        .from('messages')
+        .select()
+        .inFilter('chat_id', chatIds)
+        .order('timestamp', ascending: false);
+
+    final messagesByChat = <String, Map<String, dynamic>>{};
+    for (final message in messages) {
+      final chatId = message['chat_id'] as String;
+      if (!messagesByChat.containsKey(chatId)) {
+        messagesByChat[chatId] = message;
+      }
+    }
+    _lastMessageCache.addAll(messagesByChat);
+
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _loadUnreadCountsBatch(List<Map<String, dynamic>> chats) async {
+    for (final chat in chats) {
+      final count = await SupabaseMessagesMethods()
+          .getUnreadCount(chat['id'], widget.currentUserId)
+          .first;
+      _unreadCountCache[chat['id']] = count;
+    }
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _loadMoreChats() async {
+    if (!_hasMoreChats) {
+      return;
+    }
+
+    if (_loadingMore) {
+      return;
+    }
+
     setState(() {
-      _blockedUsers = blockedUsers;
+      _loadingMore = true;
     });
+
+    final start = _existingChats.length;
+    final end = start + 10;
+
+    final moreChats = await _supabase
+        .from('chats')
+        .select()
+        .contains('participants', [widget.currentUserId])
+        .order('last_updated', ascending: false)
+        .range(start, end);
+
+    if (moreChats.isEmpty) {
+      setState(() {
+        _hasMoreChats = false;
+        _loadingMore = false;
+      });
+      return;
+    }
+
+    setState(() {
+      _existingChats.addAll(moreChats);
+      _loadingMore = false;
+      _hasMoreChats = moreChats.length == 11;
+    });
+
+    _processNewChats(moreChats);
+  }
+
+  void _processNewChats(List<Map<String, dynamic>> newChats) async {
+    final newUserIds = <String>{};
+    final newChatIds = <String>[];
+
+    for (final chat in newChats) {
+      final participants = List<String>.from(chat['participants']);
+      final otherUserId = participants.firstWhere(
+        (id) => id != widget.currentUserId,
+      );
+      if (!_userCache.containsKey(otherUserId)) {
+        newUserIds.add(otherUserId);
+      }
+      newChatIds.add(chat['id'] as String);
+    }
+
+    if (newUserIds.isNotEmpty) {
+      await _loadUsersBatch(newUserIds.toList());
+    }
+
+    if (newChatIds.isNotEmpty) {
+      await _loadLastMessagesBatch(newChatIds);
+    }
+
+    await _loadUnreadCountsBatch(newChats);
+  }
+
+  void _refreshData() {
+    _loadInitialDataUltraFast();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshData();
+    }
+  }
+
+  Future<void> _loadBlockedUsers() async {
+    try {
+      final blockedUsers =
+          await SupabaseBlockMethods().getBlockedUsers(widget.currentUserId);
+      if (mounted) {
+        setState(() {
+          _blockedUsers = blockedUsers;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _blockedUsers = [];
+        });
+      }
+    }
+  }
+
+  Future<void> _loadSuggestions() async {
+    if (_existingChats.length >= 3) {
+      return;
+    }
+
+    final suggestedUserIds =
+        await _getSuggestedUsers(3 - _existingChats.length);
+
+    if (suggestedUserIds.isNotEmpty) {
+      final users = await _supabase
+          .from('users')
+          .select()
+          .inFilter('uid', suggestedUserIds);
+
+      if (mounted) {
+        setState(() {
+          _suggestedUsers = users.cast<Map<String, dynamic>>();
+          _showSuggestions = users.isNotEmpty;
+        });
+      }
+    }
   }
 
   Future<List<String>> _getSuggestedUsers(int count) async {
-    if (count <= 0) return [];
+    if (count <= 0) {
+      return [];
+    }
 
     final existingUserIds = _existingChats.map((chat) {
       final participants = List<String>.from(chat['participants']);
       return participants.firstWhere((id) => id != widget.currentUserId);
     }).toList();
 
-    final blockedUsers =
-        await SupabaseBlockMethods().getBlockedUsers(widget.currentUserId);
-
-    // Get following and followers from Supabase
-    final followingResponse = await _supabase
+    final followsData = await _supabase
         .from('follows')
-        .select('following_id')
-        .eq('follower_id', widget.currentUserId);
+        .select('follower_id, following_id')
+        .or('follower_id.eq.${widget.currentUserId},following_id.eq.${widget.currentUserId}');
 
-    final followersResponse = await _supabase
-        .from('follows')
-        .select('follower_id')
-        .eq('following_id', widget.currentUserId);
+    final following = <String>[];
+    final followers = <String>[];
 
-    final following = (followingResponse as List)
-        .map((r) => r['following_id'] as String)
-        .toList();
-    final followers = (followersResponse as List)
-        .map((r) => r['follower_id'] as String)
-        .toList();
+    for (final follow in followsData) {
+      if (follow['follower_id'] == widget.currentUserId) {
+        following.add(follow['following_id'] as String);
+      }
+      if (follow['following_id'] == widget.currentUserId) {
+        followers.add(follow['follower_id'] as String);
+      }
+    }
 
     List<String> candidates = [...following, ...followers]
         .where((id) => id != widget.currentUserId)
         .where((id) => !existingUserIds.contains(id))
-        .where((id) => !blockedUsers.contains(id))
+        .where((id) => !_blockedUsers.contains(id))
         .toSet()
         .toList();
 
-    List<String> suggested = candidates.take(count).toList();
-    count -= suggested.length;
-
-    if (count > 0) {
-      final allUsers = await _supabase
-          .from('users')
-          .select('uid')
-          .not(
-              'uid',
-              'in',
-              '(${[
-                ...existingUserIds,
-                widget.currentUserId,
-                ...blockedUsers
-              ].map((id) => "'$id'").join(',')})')
-          .limit(50);
-
-      final allUserIds =
-          (allUsers as List).map((user) => user['uid'] as String).toList();
-      allUserIds.shuffle();
-      suggested.addAll(allUserIds.take(count));
-    }
-
-    return suggested;
-  }
-
-  void _loadSuggestions() async {
-    final existingCount = _existingChats.length;
-    if (existingCount >= 3) return;
-
-    final suggestions = await _getSuggestedUsers(3 - existingCount);
-    if (mounted) {
-      setState(() {
-        _suggestedUserIds = suggestions;
-        _showSuggestions = suggestions.isNotEmpty;
-      });
-    }
+    return candidates.take(count).toList();
   }
 
   String _formatTimestamp(DateTime? timestamp) {
@@ -247,193 +450,284 @@ class _FeedMessagesState extends State<FeedMessages>
     );
   }
 
-  Widget _buildSuggestionItem(String userId, _FeedMessagesColorSet colors) {
-    return FutureBuilder(
-      future: _supabase.from('users').select().eq('uid', userId).single(),
-      builder: (context, snapshot) {
-        if (!snapshot.hasData || snapshot.hasError)
-          return const SizedBox.shrink();
+  Widget _buildSuggestionItem(
+      Map<String, dynamic> userData, _FeedMessagesColorSet colors) {
+    final username = userData['username'] ?? 'Unknown';
+    final photoUrl = userData['photo_url'] ?? '';
+    final userId = userData['uid'] ?? '';
 
-        final userData = snapshot.data as Map<String, dynamic>;
-        final username = userData['username'] ?? 'Unknown';
-        final photoUrl = userData['photo_url'] ?? '';
-
-        return Container(
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: colors.cardColor, width: 0.5),
+    return Container(
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: colors.cardColor, width: 0.5),
+        ),
+      ),
+      child: ListTile(
+        leading: _buildUserAvatar(photoUrl, colors),
+        title: Text(username, style: TextStyle(color: colors.textColor)),
+        trailing: Icon(Icons.person_add_alt_1, color: colors.iconColor),
+        onTap: () async {
+          final result = await Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => MessagingScreen(
+                recipientUid: userId,
+                recipientUsername: username,
+                recipientPhotoUrl: photoUrl,
+              ),
             ),
-          ),
-          child: ListTile(
-            leading: _buildUserAvatar(photoUrl, colors),
-            title: Text(username, style: TextStyle(color: colors.textColor)),
-            trailing: Icon(Icons.person_add_alt_1, color: colors.iconColor),
-            onTap: () async {
-              final result = await Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => MessagingScreen(
-                    recipientUid: userId,
-                    recipientUsername: username,
-                    recipientPhotoUrl: photoUrl,
-                  ),
-                ),
-              );
+          );
 
-              // Refresh data when returning from messaging screen
-              if (result == true) {
-                _refreshData();
-              }
-            },
-          ),
-        );
-      },
+          if (result == true) {
+            _refreshData();
+          }
+        },
+      ),
     );
   }
 
   Widget _buildChatItem(
       Map<String, dynamic> chat, _FeedMessagesColorSet colors) {
     final participants = List<String>.from(chat['participants']);
-    final otherUserId = participants
-        .firstWhere((id) => id != widget.currentUserId, orElse: () => '');
+    final otherUserId = participants.firstWhere(
+      (id) => id != widget.currentUserId,
+      orElse: () => '',
+    );
 
     if (otherUserId.isEmpty) return const SizedBox.shrink();
 
-    return FutureBuilder(
-      future: Future.wait<dynamic>([
-        _supabase.from('users').select().eq('uid', otherUserId).single(),
-        SupabaseBlockMethods()
-            .isMutuallyBlocked(widget.currentUserId, otherUserId)
-      ]),
-      builder: (context, AsyncSnapshot<List<dynamic>> snapshot) {
-        if (!snapshot.hasData) return const SizedBox.shrink();
+    if (_blockedUsers.contains(otherUserId)) {
+      return _buildBlockedMessageItem(colors);
+    }
 
-        final userData = snapshot.data![0] as Map<String, dynamic>;
-        final isMutuallyBlocked = snapshot.data![1] as bool;
+    final userData = _userCache[otherUserId];
+    if (userData == null) {
+      return _buildDetailedChatSkeleton(colors);
+    }
 
-        if (isMutuallyBlocked) {
-          return _buildBlockedMessageItem(colors);
-        }
+    final username = userData['username'] ?? 'Unknown';
+    final photoUrl = userData['photo_url'] ?? '';
 
-        final username = userData['username'] ?? 'Unknown';
-        final photoUrl = userData['photo_url'] ?? '';
+    final lastMessageData = _lastMessageCache[chat['id']];
 
-        return FutureBuilder(
-          future: _supabase
-              .from('messages')
-              .select()
-              .eq('chat_id', chat['id'])
-              .order('timestamp', ascending: false)
-              .limit(1)
-              .maybeSingle(),
-          builder: (context, messageSnapshot) {
-            String lastMessage = 'No messages yet';
-            String timestampText = '';
-            bool isCurrentUserSender = false;
-            bool isMessageRead = false;
+    String lastMessage = 'No messages yet';
+    String timestampText = '';
+    bool isCurrentUserSender = false;
+    bool isMessageRead = false;
 
-            if (messageSnapshot.hasData && messageSnapshot.data != null) {
-              final messageData = messageSnapshot.data as Map<String, dynamic>;
+    if (lastMessageData != null) {
+      isMessageRead = lastMessageData['is_read'] ?? false;
+      lastMessage = lastMessageData['message'] ?? '';
+      final DateTime? timestamp = lastMessageData['timestamp'] is String
+          ? DateTime.parse(lastMessageData['timestamp'])
+          : lastMessageData['timestamp'];
+      timestampText = _formatTimestamp(timestamp);
+      isCurrentUserSender =
+          lastMessageData['sender_id'] == widget.currentUserId;
+    }
 
-              isMessageRead = messageData['is_read'] ?? false;
-              lastMessage = messageData['message'] ?? '';
-              final DateTime? timestamp = messageData['timestamp'] is String
-                  ? DateTime.parse(messageData['timestamp'])
-                  : messageData['timestamp'];
-              timestampText = _formatTimestamp(timestamp);
-              isCurrentUserSender =
-                  messageData['sender_id'] == widget.currentUserId;
-            }
+    final unreadCount = _unreadCountCache[chat['id']] ?? 0;
 
-            return StreamBuilder<int>(
-              stream: SupabaseMessagesMethods()
-                  .getUnreadCount(chat['id'], widget.currentUserId),
-              builder: (context, unreadSnapshot) {
-                final unreadCount = unreadSnapshot.data ?? 0;
+    return Container(
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: colors.cardColor, width: 0.5),
+        ),
+      ),
+      child: ListTile(
+        leading: _buildUserAvatar(photoUrl, colors),
+        title: Text(username, style: TextStyle(color: colors.textColor)),
+        subtitle: Row(
+          children: [
+            if (isCurrentUserSender)
+              Icon(
+                isMessageRead ? Icons.done_all : Icons.done,
+                size: 16,
+                color: colors.textColor.withOpacity(0.6),
+              ),
+            Expanded(
+              child: Text(
+                lastMessage,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: colors.textColor.withOpacity(0.6)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              timestampText,
+              style: TextStyle(
+                color: colors.textColor.withOpacity(0.6),
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+        trailing: unreadCount > 0
+            ? Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: colors.unreadBadgeColor,
+                  shape: BoxShape.circle,
+                ),
+                child: Text(
+                  unreadCount.toString(),
+                  style: TextStyle(color: colors.textColor, fontSize: 12),
+                ),
+              )
+            : null,
+        onTap: () async {
+          await SupabaseMessagesMethods()
+              .markMessagesAsRead(chat['id'], widget.currentUserId);
 
-                return Container(
-                  decoration: BoxDecoration(
-                    border: Border(
-                      bottom: BorderSide(color: colors.cardColor, width: 0.5),
-                    ),
-                  ),
-                  child: ListTile(
-                    leading: _buildUserAvatar(photoUrl, colors),
-                    title: Text(username,
-                        style: TextStyle(color: colors.textColor)),
-                    subtitle: Row(
-                      children: [
-                        if (isCurrentUserSender)
-                          Icon(
-                            isMessageRead ? Icons.done_all : Icons.done,
-                            size: 16,
-                            color: colors.textColor.withOpacity(0.6),
-                          ),
-                        Expanded(
-                          child: Text(
-                            lastMessage,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                                color: colors.textColor.withOpacity(0.6)),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          timestampText,
-                          style: TextStyle(
-                              color: colors.textColor.withOpacity(0.6),
-                              fontSize: 12),
-                        ),
-                      ],
-                    ),
-                    trailing: unreadCount > 0
-                        ? Container(
-                            padding: const EdgeInsets.all(6),
-                            decoration: BoxDecoration(
-                              color: colors.unreadBadgeColor,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Text(
-                              unreadCount.toString(),
-                              style: TextStyle(
-                                  color: colors.textColor, fontSize: 12),
-                            ),
-                          )
-                        : null,
-                    onTap: () async {
-                      // Mark messages as read immediately
-                      await SupabaseMessagesMethods()
-                          .markMessagesAsRead(chat['id'], widget.currentUserId);
+          _unreadCountCache[chat['id']] = 0;
+          setState(() {});
 
-                      // Navigate to messaging screen and wait for result
-                      final result = await Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) => MessagingScreen(
-                            recipientUid: otherUserId,
-                            recipientUsername: username,
-                            recipientPhotoUrl: photoUrl,
-                          ),
-                        ),
-                      );
+          final result = await Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => MessagingScreen(
+                recipientUid: otherUserId,
+                recipientUsername: username,
+                recipientPhotoUrl: photoUrl,
+              ),
+            ),
+          );
 
-                      // Refresh data when returning from messaging screen
-                      if (result == true) {
-                        _refreshData();
-                      }
-                    },
-                  ),
-                );
-              },
-            );
-          },
-        );
-      },
+          if (result == true) {
+            _refreshData();
+          }
+        },
+      ),
+    );
+  }
+
+  Widget _buildDetailedChatSkeleton(_FeedMessagesColorSet colors) {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: colors.cardColor, width: 0.5),
+        ),
+      ),
+      child: ListTile(
+        leading: CircleAvatar(
+          radius: 21,
+          backgroundColor: colors.cardColor.withOpacity(0.5),
+        ),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              height: 14,
+              width: 120,
+              decoration: BoxDecoration(
+                color: colors.cardColor.withOpacity(0.5),
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Container(
+              height: 12,
+              width: 180,
+              decoration: BoxDecoration(
+                color: colors.cardColor.withOpacity(0.4),
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+          ],
+        ),
+        trailing: Container(
+          width: 40,
+          height: 20,
+          decoration: BoxDecoration(
+            color: colors.cardColor.withOpacity(0.4),
+            borderRadius: BorderRadius.circular(10),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSuggestionSkeleton(_FeedMessagesColorSet colors) {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: colors.cardColor, width: 0.5),
+        ),
+      ),
+      child: ListTile(
+        leading: CircleAvatar(
+          radius: 21,
+          backgroundColor: colors.cardColor.withOpacity(0.5),
+        ),
+        title: Container(
+          height: 16,
+          width: 100,
+          decoration: BoxDecoration(
+            color: colors.cardColor.withOpacity(0.5),
+            borderRadius: BorderRadius.circular(4),
+          ),
+        ),
+        trailing: Container(
+          width: 24,
+          height: 24,
+          decoration: BoxDecoration(
+            color: colors.cardColor.withOpacity(0.4),
+            shape: BoxShape.circle,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionHeaderSkeleton(_FeedMessagesColorSet colors) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
+      child: Container(
+        height: 18,
+        width: 80,
+        decoration: BoxDecoration(
+          color: colors.cardColor.withOpacity(0.6),
+          borderRadius: BorderRadius.circular(4),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyStateSkeleton(_FeedMessagesColorSet colors) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(
+          Icons.chat_bubble_outline,
+          size: 64,
+          color: colors.textColor.withOpacity(0.3),
+        ),
+        const SizedBox(height: 16),
+        Container(
+          height: 20,
+          width: 150,
+          decoration: BoxDecoration(
+            color: colors.cardColor.withOpacity(0.5),
+            borderRadius: BorderRadius.circular(4),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          height: 16,
+          width: 200,
+          decoration: BoxDecoration(
+            color: colors.cardColor.withOpacity(0.4),
+            borderRadius: BorderRadius.circular(4),
+          ),
+        ),
+      ],
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
+
     final themeProvider = Provider.of<ThemeProvider>(context);
     final colors = _getColors(themeProvider);
 
@@ -445,67 +739,77 @@ class _FeedMessagesState extends State<FeedMessages>
         title: Text('Messages', style: TextStyle(color: colors.textColor)),
         elevation: 0,
       ),
-      body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: _supabase
-            .from('chats')
-            .select()
-            .contains('participants', [widget.currentUserId]),
-        builder: (context, chatSnapshot) {
-          if (chatSnapshot.connectionState == ConnectionState.waiting) {
-            return Center(
-                child: CircularProgressIndicator(
-                    color: colors.progressIndicatorColor));
+      body: _isLoading
+          ? _buildEnhancedSkeletonLoading(colors)
+          : _buildContent(colors),
+    );
+  }
+
+  Widget _buildEnhancedSkeletonLoading(_FeedMessagesColorSet colors) {
+    return ListView(
+      children: [
+        _buildSectionHeaderSkeleton(colors),
+        _buildDetailedChatSkeleton(colors),
+        _buildDetailedChatSkeleton(colors),
+        _buildDetailedChatSkeleton(colors),
+        _buildSectionHeaderSkeleton(colors),
+        _buildSuggestionSkeleton(colors),
+        _buildSuggestionSkeleton(colors),
+        _buildDetailedChatSkeleton(colors),
+        _buildDetailedChatSkeleton(colors),
+      ],
+    );
+  }
+
+  Widget _buildContent(_FeedMessagesColorSet colors) {
+    final hasChats = _existingChats.isNotEmpty;
+    final hasSuggestions = _showSuggestions && _suggestedUsers.isNotEmpty;
+
+    if (!hasChats && !hasSuggestions) {
+      return Center(
+        child: _buildEmptyStateSkeleton(colors),
+      );
+    }
+
+    final totalItemCount = _existingChats.length +
+        _suggestedUsers.length +
+        (_hasMoreChats ? 1 : 0);
+
+    return NotificationListener<ScrollNotification>(
+      onNotification: (scrollNotification) {
+        if (scrollNotification is ScrollEndNotification) {
+          final metrics = scrollNotification.metrics;
+          if (metrics.extentAfter < 500) {
+            _loadMoreChats();
           }
-
-          if (!chatSnapshot.hasData || chatSnapshot.data!.isEmpty) {
-            if (_suggestedUserIds.isEmpty) {
-              _loadSuggestions();
-            }
-
-            return _suggestedUserIds.isEmpty
-                ? Center(
-                    child: Text(
-                      'No chats yet',
-                      style:
-                          TextStyle(color: colors.textColor.withOpacity(0.6)),
-                    ),
-                  )
-                : ListView(
-                    children: _suggestedUserIds
-                        .map((userId) => _buildSuggestionItem(userId, colors))
-                        .toList(),
-                  );
+        }
+        return false;
+      },
+      child: ListView.builder(
+        itemCount: totalItemCount,
+        itemBuilder: (context, index) {
+          if (index < _existingChats.length) {
+            final chat = _existingChats[index];
+            return _buildChatItem(chat, colors);
+          } else if (index < _existingChats.length + _suggestedUsers.length) {
+            final suggestionIndex = index - _existingChats.length;
+            final userData = _suggestedUsers[suggestionIndex];
+            return _buildSuggestionItem(userData, colors);
+          } else {
+            return _buildLoadingIndicator(colors);
           }
-
-          final allChats = chatSnapshot.data!;
-          _existingChats = allChats.where((chat) {
-            final participants = List<String>.from(chat['participants']);
-            final otherUserId = participants.firstWhere(
-                (id) => id != widget.currentUserId,
-                orElse: () => '');
-            return otherUserId.isNotEmpty &&
-                !_blockedUsers.contains(otherUserId);
-          }).toList();
-
-          if (_suggestedUserIds.isEmpty) {
-            _loadSuggestions();
-          }
-
-          // Reset refresh flag
-          _needsRefresh = false;
-
-          return ListView(
-            children: [
-              ..._existingChats
-                  .map((chat) => _buildChatItem(chat, colors))
-                  .toList(),
-              if (_showSuggestions)
-                ..._suggestedUserIds
-                    .map((userId) => _buildSuggestionItem(userId, colors))
-                    .toList(),
-            ],
-          );
         },
+      ),
+    );
+  }
+
+  Widget _buildLoadingIndicator(_FeedMessagesColorSet colors) {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Center(
+        child: CircularProgressIndicator(
+          color: colors.progressIndicatorColor,
+        ),
       ),
     );
   }
