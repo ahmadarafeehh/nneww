@@ -12,6 +12,7 @@ import 'package:provider/provider.dart';
 import 'package:Ratedly/models/user.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:video_trimmer/video_trimmer.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class AddPostScreen extends StatefulWidget {
   final VoidCallback? onPostUploaded;
@@ -30,6 +31,7 @@ class _AddPostScreenState extends State<AddPostScreen> {
   final FocusNode _captionFocusNode = FocusNode();
   final double _maxFileSize = 2.5 * 1024 * 1024;
   final double _maxVideoSize = 50 * 1024 * 1024;
+  bool _hasAgreedToWarning = false;
 
   // Video trimming variables
   final Trimmer _trimmer = Trimmer();
@@ -43,8 +45,85 @@ class _AddPostScreenState extends State<AddPostScreen> {
   void initState() {
     super.initState();
     _descriptionController.addListener(() {
-      setState(() {}); // Trigger rebuild to update character counter
+      setState(() {});
     });
+    _checkIfUserAgreed();
+  }
+
+  Future<void> _checkIfUserAgreed() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _hasAgreedToWarning = prefs.getBool('hasAgreedToPostingWarning') ?? false;
+    });
+  }
+
+  Future<void> _saveUserAgreement() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('hasAgreedToPostingWarning', true);
+    setState(() {
+      _hasAgreedToWarning = true;
+    });
+  }
+
+  Future<void> _showWarningDialog() async {
+    if (_hasAgreedToWarning) {
+      _selectMedia(context);
+      return;
+    }
+
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: mobileBackgroundColor,
+          title: Text(
+            'Ratedly Guidlines',
+            style: TextStyle(
+              color: primaryColor,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          content: Text.rich(
+            TextSpan(
+              children: [
+                TextSpan(
+                  text: 'Posting inappropriate content will get your device ',
+                  style: TextStyle(color: primaryColor),
+                ),
+                TextSpan(
+                  text: 'permanently banned',
+                  style: TextStyle(
+                    color: Colors.red,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                TextSpan(
+                  text: '.',
+                  style: TextStyle(color: primaryColor),
+                ),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: Text(
+                'I Understand',
+                style: TextStyle(
+                  color: primaryColor,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              onPressed: () async {
+                await _saveUserAgreement();
+                Navigator.of(context).pop();
+                _selectMedia(context);
+              },
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
@@ -169,7 +248,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
       if (pickedFile != null) {
         final File videoFile = File(pickedFile.path);
 
-        // Check video size
         if (await videoFile.length() > _maxVideoSize) {
           if (context.mounted) {
             showSnackBar(context,
@@ -179,10 +257,7 @@ class _AddPostScreenState extends State<AddPostScreen> {
           return;
         }
 
-        // Store the original video file and go directly to trimming
         _videoFile = videoFile;
-
-        // Load video into trimmer
         _loadVideo();
 
         setState(() {
@@ -262,7 +337,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
   }
 
   void postMedia(AppUser user) async {
-    // Check caption character limit
     if (_descriptionController.text.length > 250) {
       if (context.mounted) {
         showSnackBar(context,
@@ -271,7 +345,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
       return;
     }
 
-    // Prevent multiple presses
     if (isLoading) return;
 
     if (user.uid.isEmpty) {
@@ -301,7 +374,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
       final String res;
 
       if (_isVideo) {
-        // If we're in trimming mode, trim the video first
         if (_isTrimming) {
           setState(() => _progressVisibility = true);
           final String? trimmedPath = await _trimVideo();
@@ -367,7 +439,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
     });
   }
 
-  // Helper method to build post button with loading state
   Widget _buildPostButton(bool isLoading, VoidCallback onPressed) {
     return IgnorePointer(
       ignoring: isLoading,
@@ -385,7 +456,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
     );
   }
 
-  // Helper method to build caption input with character counter
   Widget _buildCaptionInput(AppUser user) {
     final bool isNearLimit = _descriptionController.text.length > 200;
     final bool isOverLimit = _descriptionController.text.length > 250;
@@ -421,11 +491,10 @@ class _AddPostScreenState extends State<AddPostScreen> {
                 ),
                 style: TextStyle(color: primaryColor),
                 maxLines: 3,
-                maxLength: 250, // Added 250 character limit
+                maxLength: 250,
               ),
             ),
             SizedBox(width: 8),
-            // OK Button to dismiss keyboard
             if (_captionFocusNode.hasFocus)
               TextButton(
                 onPressed: _dismissKeyboard,
@@ -439,7 +508,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
               ),
           ],
         ),
-        // Show character counter only when near or over limit
         if (isNearLimit)
           Padding(
             padding: const EdgeInsets.only(left: 56.0, top: 4.0),
@@ -463,7 +531,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
         leading: IconButton(
           icon: Icon(Icons.arrow_back, color: primaryColor),
           onPressed: () {
-            // Go directly back to profile when back button is pressed
             clearMedia();
             Navigator.pop(context);
           },
@@ -475,14 +542,12 @@ class _AddPostScreenState extends State<AddPostScreen> {
       ),
       body: Column(
         children: [
-          // Video Trimmer Section
           Expanded(
             child: Container(
               padding: EdgeInsets.only(bottom: 16.0),
               color: Colors.black,
               child: Column(
                 children: <Widget>[
-                  // Show progress indicator for both trimming and uploading
                   if (_progressVisibility || isLoading)
                     LinearProgressIndicator(
                       color: primaryColor,
@@ -530,8 +595,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
               ),
             ),
           ),
-
-          // Caption Input Section
           Container(
             color: mobileBackgroundColor,
             padding: EdgeInsets.all(16.0),
@@ -552,12 +615,10 @@ class _AddPostScreenState extends State<AddPostScreen> {
       );
     }
 
-    // If we're trimming a video, show the trimmer interface directly
     if (_isTrimming) {
       return _buildVideoTrimmer(user);
     }
 
-    // Main screen - only for images or initial selection
     return Scaffold(
       appBar: AppBar(
         iconTheme: IconThemeData(color: primaryColor),
@@ -571,7 +632,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
         ),
         title: Text('Ratedly', style: TextStyle(color: primaryColor)),
         actions: [
-          // Only show Post button for images (videos go directly to trimming)
           if (_file != null && !_isVideo)
             _buildPostButton(isLoading, () => postMedia(user)),
         ],
@@ -580,7 +640,7 @@ class _AddPostScreenState extends State<AddPostScreen> {
           ? Center(
               child: IconButton(
                 icon: Icon(Icons.upload, color: primaryColor, size: 50),
-                onPressed: () => _selectMedia(context),
+                onPressed: () => _showWarningDialog(),
               ),
             )
           : SingleChildScrollView(
@@ -591,7 +651,6 @@ class _AddPostScreenState extends State<AddPostScreen> {
                       color: primaryColor,
                       backgroundColor: primaryColor.withOpacity(0.2),
                     ),
-                  // Only show image preview (videos go directly to trimming)
                   if (!_isVideo && _file != null)
                     Container(
                       height: MediaQuery.of(context).size.height * 0.5,
