@@ -209,8 +209,9 @@ class _NotificationListState extends State<_NotificationList> {
       final supabase = Supabase.instance.client;
       final limit = initialLoad ? _initialLimit : _loadMoreLimit;
       final userId = widget.currentUserId;
+      final offset = initialLoad ? 0 : _notifications.length;
 
-      // Parse different response shapes
+      // Parse response
       List<Map<String, dynamic>> _parseResponse(dynamic resp) {
         try {
           if (resp == null) return [];
@@ -225,48 +226,20 @@ class _NotificationListState extends State<_NotificationList> {
         }
       }
 
-      // Try snake_case column names first
-      List<Map<String, dynamic>> newNotifications = [];
-      try {
-        final response = await supabase
-            .from('notifications')
-            .select()
-            .eq('target_user_id', userId)
-            .neq('type', 'message')
-            .order('created_at', ascending: false)
-            .limit(limit);
+      // Use range-based pagination
+      final query = supabase
+          .from('notifications')
+          .select()
+          .eq('target_user_id', userId)
+          .neq('type', 'message')
+          .order('created_at', ascending: false)
+          .range(offset, offset + limit - 1);
 
-        newNotifications = _parseResponse(response);
-      } catch (err) {
-        // If snake_case fails, try camelCase
-        try {
-          final response = await supabase
-              .from('notifications')
-              .select()
-              .eq('targetUserId', userId)
-              .neq('type', 'message')
-              .order('createdAt', ascending: false)
-              .limit(limit);
-
-          newNotifications = _parseResponse(response);
-        } catch (err) {
-          // Both failed, return empty list
-        }
-      }
+      final response = await query;
+      final newNotifications = _parseResponse(response);
 
       if (newNotifications.isNotEmpty) {
-        final lastNotification = newNotifications.last;
-        final lastTimestamp = lastNotification['createdAt'] ??
-            lastNotification['created_at'] ??
-            DateTime.now().toIso8601String();
-
-        if (lastTimestamp is String) {
-          _lastCreatedAt = DateTime.tryParse(lastTimestamp);
-        } else if (lastTimestamp is DateTime) {
-          _lastCreatedAt = lastTimestamp;
-        }
-
-        // Prefetch user data for all notifications
+        // Prefetch user data
         await _prefetchUserData(newNotifications);
 
         setState(() {
@@ -274,8 +247,11 @@ class _NotificationListState extends State<_NotificationList> {
         });
       }
 
+      // Check if there are more notifications to load
       setState(() => _hasMore = newNotifications.length == limit);
     } catch (e, st) {
+      print('Error loading notifications: $e');
+      print('Stack trace: $st');
       setState(() => _hasMore = false);
     } finally {
       if (mounted) {
@@ -284,6 +260,20 @@ class _NotificationListState extends State<_NotificationList> {
           _isLoadingMore = false;
         });
       }
+    }
+  }
+
+// Helper method to parse timestamp
+  DateTime _parseTimestamp(dynamic timestamp) {
+    try {
+      if (timestamp is String) {
+        return DateTime.parse(timestamp);
+      } else if (timestamp is DateTime) {
+        return timestamp;
+      }
+      return DateTime.now();
+    } catch (e) {
+      return DateTime.now();
     }
   }
 
